@@ -69,6 +69,20 @@ func (c *client) getRegionForRpc(ctx context.Context, rpc hrpc.Call) (hrpc.Regio
 	return nil, ErrCannotFindRegion
 }
 
+// SendBatch will execute all the calls in the Batch. Batches should
+// not be reused after passing to SendBatch.
+//
+// SendBatch will discover the correct region and region server for
+// each RPC and dispatch the RPCs accordingly. SendBatch will return
+// only after ctx times out or is cancelled, or after receiving a
+// response, success or failure, for every RPC in the Batch.
+//
+// SendBatch is not an atomic operation. Some calls may fail and
+// others succeed.
+func (c *client) SendBatch(ctx context.Context, b *Batch) error {
+	return nil
+}
+
 func (c *client) SendRPC(rpc hrpc.Call) (msg proto.Message, err error) {
 	start := time.Now()
 	description := rpc.Description()
