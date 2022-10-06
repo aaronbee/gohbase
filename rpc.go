@@ -13,6 +13,7 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -79,7 +80,76 @@ func (c *client) getRegionForRpc(ctx context.Context, rpc hrpc.Call) (hrpc.Regio
 //
 // SendBatch is not an atomic operation. Some calls may fail and
 // others succeed.
+//
+// SendBatch returns a non-nil error if some or all of the Batch
+// failed to be applied. If the error is a [RPCErrors] type then the
+// failed RPCS can be inspected along with their respective errors.
+// RPCs not present in the RPCErrors have succeeded. If the returned
+// error is not an RPCErrors then all RPCs should be assumed to have
+// failed.
 func (c *client) SendBatch(ctx context.Context, b *Batch) error {
+	rpcByRegion := make(map[hrpc.RegionInfo][]hrpc.Call)
+	for _, rpc := range b.ms {
+		reg, err := c.getRegionForRpc(ctx, rpc)
+		if err != nil {
+			return err
+		}
+		rpc.SetRegion(reg)
+		rpcByRegion[reg] = append(rpcByRegion[reg], rpc)
+	}
+	rpcByClient := make(map[hrpc.RegionClient][]hrpc.Call)
+	for reg, rpcs := range rpcByRegion {
+		client := reg.Client()
+		if client == nil {
+			// There was an error queueing the RPC.
+			// Mark the region as unavailable.
+			if reg.MarkUnavailable() {
+				// If this was the first goroutine to mark the region as
+				// unavailable, start a goroutine to reestablish a connection
+
+				// TODO: Rather than do this in a goroutine, we could
+				// do a direct call of reestablishRegion so that we
+				// don't return an error and require the client to
+				// retry after sleeping an arbitrary amount of time.
+				// That change would require reestablishRegion to take
+				// in a context, so that it doesn't retry forever.
+				// Though, this doesn't handle the case that
+				// MarkUnavailable returns false.
+				go c.reestablishRegion(reg)
+			}
+			return region.NotServingRegionError{}
+		}
+		rpcByClient[client] = append(rpcByClient[client], rpcs...)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(len(rpcByClient))
+	errsCh := make(chan RPCErrors, len(rpcByClient))
+
+	for client, rpcs := range rpcByClient {
+		// TODO: Maybe move this to the RegionClient interface so we
+		// don't need to do this check here.
+		qb, ok := client.(interface {
+			QueueBatch(ctx context.Context, rpcs []hrpc.Call)
+		})
+		if !ok {
+			return errors.New("client doesn't support QueueBatch")
+		}
+		go func(client hrpc.RegionClient, rpcs []hrpc.Call) {
+			defer wg.Done()
+			qb.QueueBatch(ctx, rpcs)
+			errsCh <- c.waitForCompletion(ctx, client, rpcs)
+		}(client, rpcs)
+	}
+	wg.Wait()
+	close(errsCh)
+	var err RPCErrors
+	for errs := range errsCh {
+		err = append(err, errs...)
+	}
+	if len(err) > 0 {
+		return err
+	}
 	return nil
 }
 
@@ -139,6 +209,56 @@ func (c *client) SendRPC(rpc hrpc.Call) (msg proto.Message, err error) {
 			return msg, err
 		}
 	}
+}
+
+// RPCErrors is a slice of failed RPCs.
+type RPCErrors []RPCError
+
+func (r RPCErrors) Error() string {
+	return "errors executing batch. Inspect them by type asserting error to RPCErrors"
+}
+
+// RPCError contains an RPC and an associated error.
+type RPCError struct {
+	RPC hrpc.Call
+	Err error
+}
+
+func (c *client) waitForCompletion(ctx context.Context, rc hrpc.RegionClient,
+	rpcs []hrpc.Call) RPCErrors {
+	var errors RPCErrors
+	cancelledIndex := -1
+	for i, rpc := range rpcs {
+		select {
+		case res := <-rpc.ResultChan():
+			if res.Error != nil {
+				c.handleResultError(res.Error, rpc.Region(), rc)
+				errors = append(errors, RPCError{RPC: rpc, Err: res.Error})
+			}
+		case <-ctx.Done():
+			cancelledIndex = i
+			break
+		}
+	}
+	if cancelledIndex >= 0 {
+		err := ctx.Err()
+		// The context has been cancelled. Do a non-blocking check if
+		// a result is ready on each RPC, otherwise mark it with the
+		// context error.
+		for _, rpc := range rpcs[cancelledIndex:] {
+			select {
+			case res := <-rpc.ResultChan():
+				if res.Error != nil {
+					c.handleResultError(res.Error, rpc.Region(), rc)
+					errors = append(errors, RPCError{RPC: rpc, Err: res.Error})
+				}
+			default:
+				errors = append(errors, RPCError{RPC: rpc, Err: err})
+			}
+		}
+	}
+
+	return errors
 }
 
 func (c *client) handleResultError(err error, reg hrpc.RegionInfo, rc hrpc.RegionClient) {
