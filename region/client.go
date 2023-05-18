@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aristanetworks/glog"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
@@ -99,6 +100,27 @@ const (
 	MasterClient = ClientType("MasterService")
 )
 
+type TrackingID uint64
+
+var currID atomic.Uint64
+
+func GetTrackingID() TrackingID {
+	return TrackingID(currID.Add(1))
+}
+
+type ctxkey int
+
+const idKey ctxkey = iota
+
+func NewContextWithTrackingID(ctx context.Context, id TrackingID) context.Context {
+	return context.WithValue(ctx, idKey, id)
+}
+
+func TrackingIDFromContext(ctx context.Context) (TrackingID, bool) {
+	id, ok := ctx.Value(idKey).(TrackingID)
+	return id, ok
+}
+
 var bufferPool sync.Pool
 
 func newBuffer(size int) []byte {
@@ -155,6 +177,11 @@ func (e NotServingRegionError) Error() string {
 	return formatErr(e, e.error)
 }
 
+type calls struct {
+	ctx   context.Context
+	calls []hrpc.Call
+}
+
 // client manages a connection to a RegionServer.
 type client struct {
 	conn net.Conn
@@ -168,7 +195,7 @@ type client struct {
 	// failOnce used for concurrent calls to fail
 	failOnce sync.Once
 
-	rpcs chan []hrpc.Call
+	rpcs chan calls
 	done chan struct{}
 
 	// sent contains the mapping of sent call IDs to RPC calls, so that when
@@ -219,6 +246,7 @@ func (c *client) QueueRPC(rpc hrpc.Call) {
 // QueueBatch will add rpcs to the queue for processing by the writer
 // goroutine
 func (c *client) QueueBatch(ctx context.Context, rpcs []hrpc.Call) {
+	calls := calls{ctx, rpcs}
 	select {
 	case <-ctx.Done():
 	case <-c.done:
@@ -227,7 +255,7 @@ func (c *client) QueueBatch(ctx context.Context, rpcs []hrpc.Call) {
 		for _, c := range rpcs {
 			c.ResultChan() <- res
 		}
-	case c.rpcs <- rpcs:
+	case c.rpcs <- calls:
 	}
 }
 
@@ -373,8 +401,12 @@ func (c *client) processRPCs() {
 			case <-c.done:
 				return
 			case rpcs := <-c.rpcs:
+				id, track := TrackingIDFromContext(rpcs.ctx)
+				if track {
+					glog.Infof("id=%x client=%s step=processRPCs_chanreadable", id, c.addr)
+				}
 				// have things queued up, batch them
-				if !m.add(rpcs) {
+				if !m.add(rpcs.calls) {
 					// can still put more rpcs into batch
 					continue
 				}
@@ -390,7 +422,11 @@ func (c *client) processRPCs() {
 			case <-c.done:
 				return
 			case rpcs := <-c.rpcs:
-				m.add(rpcs)
+				id, track := TrackingIDFromContext(rpcs.ctx)
+				if track {
+					glog.Infof("id=%x client=%s step=processRPCs_waitForOne", id, c.addr)
+				}
+				m.add(rpcs.calls)
 			}
 			continue
 		} else if l >= c.rpcQueueSize || c.flushInterval == 0 {
@@ -412,7 +448,11 @@ func (c *client) processRPCs() {
 				reason = "timeout"
 				// time to flush
 			case rpcs := <-c.rpcs:
-				if !m.add(rpcs) {
+				id, track := TrackingIDFromContext(rpcs.ctx)
+				if track {
+					glog.Infof("id=%x client=%s step=processRPCs_waitForTimer", id, c.addr)
+				}
+				if !m.add(rpcs.calls) {
 					// can still put more rpcs into batch
 					continue
 				}

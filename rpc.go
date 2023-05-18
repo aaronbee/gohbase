@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aristanetworks/glog"
 	log "github.com/sirupsen/logrus"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/internal/observability"
@@ -88,6 +89,7 @@ func (c *client) getRegionForRpc(ctx context.Context, rpc hrpc.Call) (hrpc.Regio
 // error is not an RPCErrors then all RPCs should be assumed to have
 // failed.
 func (c *client) SendBatch(ctx context.Context, b *Batch) error {
+	id, track := region.TrackingIDFromContext(ctx)
 	rpcByRegion := make(map[hrpc.RegionInfo][]hrpc.Call)
 	for _, rpc := range b.ms {
 		reg, err := c.getRegionForRpc(ctx, rpc)
@@ -137,8 +139,17 @@ func (c *client) SendBatch(ctx context.Context, b *Batch) error {
 		}
 		go func(client hrpc.RegionClient, rpcs []hrpc.Call) {
 			defer wg.Done()
+			if track {
+				glog.Infof("id=%x client=%s step=QueueBatch", id, client.Addr())
+			}
 			qb.QueueBatch(ctx, rpcs)
+			if track {
+				glog.Infof("id=%x client=%s step=waitForCompletion", id, client.Addr())
+			}
 			errsCh <- c.waitForCompletion(ctx, client, rpcs)
+			if track {
+				glog.Infof("id=%x client=%s step=gotResult", id, client.Addr())
+			}
 		}(client, rpcs)
 	}
 	wg.Wait()
