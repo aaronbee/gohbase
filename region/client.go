@@ -236,7 +236,7 @@ func (c *client) QueueRPC(rpc hrpc.Call) {
 			// request. The function that placed the RPC in our queue should
 			// stop waiting for a result and return an error.
 		default:
-			if err := c.trySend(rpc); err != nil {
+			if err := c.trySend(rpc, false); err != nil {
 				returnResult(rpc, nil, err)
 			}
 		}
@@ -372,7 +372,7 @@ func (c *client) processRPCs() {
 		m.returnResults(nil, ErrClientClosed)
 	}()
 
-	flush := func(reason string) {
+	flush := func(reason string, track bool) {
 		if log.GetLevel() == log.DebugLevel {
 			log.WithFields(log.Fields{
 				"len":  m.len(),
@@ -384,7 +384,10 @@ func (c *client) processRPCs() {
 			"reason": reason,
 		}).Inc()
 
-		if err := c.trySend(m); err != nil {
+		if track {
+			glog.Infof("step=trySend")
+		}
+		if err := c.trySend(m, track); err != nil {
 			m.returnResults(nil, err)
 		}
 
@@ -393,6 +396,7 @@ func (c *client) processRPCs() {
 	}
 
 	for {
+		var trackBatch bool
 		// first loop is to accomodate request heavy workload
 		// it will batch as long as conccurent writers are sending
 		// new rpcs or until multi is filled up
@@ -403,6 +407,7 @@ func (c *client) processRPCs() {
 			case rpcs := <-c.rpcs:
 				id, track := TrackingIDFromContext(rpcs.ctx)
 				if track {
+					trackBatch = true
 					glog.Infof("id=%x client=%s step=processRPCs_chanreadable", id, c.addr)
 				}
 				// have things queued up, batch them
@@ -424,6 +429,7 @@ func (c *client) processRPCs() {
 			case rpcs := <-c.rpcs:
 				id, track := TrackingIDFromContext(rpcs.ctx)
 				if track {
+					trackBatch = true
 					glog.Infof("id=%x client=%s step=processRPCs_waitForOne", id, c.addr)
 				}
 				m.add(rpcs.calls)
@@ -431,7 +437,7 @@ func (c *client) processRPCs() {
 			continue
 		} else if l >= c.rpcQueueSize || c.flushInterval == 0 {
 			// batch is full, flush
-			flush("queue full")
+			flush("queue full", trackBatch)
 			continue
 		}
 
@@ -450,6 +456,7 @@ func (c *client) processRPCs() {
 			case rpcs := <-c.rpcs:
 				id, track := TrackingIDFromContext(rpcs.ctx)
 				if track {
+					trackBatch = true
 					glog.Infof("id=%x client=%s step=processRPCs_waitForTimer", id, c.addr)
 				}
 				if !m.add(rpcs.calls) {
@@ -464,7 +471,7 @@ func (c *client) processRPCs() {
 			}
 			break
 		}
-		flush(reason)
+		flush(reason, trackBatch)
 	}
 }
 
@@ -476,8 +483,8 @@ func returnResult(c hrpc.Call, msg proto.Message, err error) {
 	}
 }
 
-func (c *client) trySend(rpc hrpc.Call) (err error) {
-	if id, err := c.send(rpc); err != nil {
+func (c *client) trySend(rpc hrpc.Call, track bool) (err error) {
+	if id, err := c.send(rpc, track); err != nil {
 		if _, ok := err.(ServerError); ok {
 			c.fail(err)
 		}
@@ -665,7 +672,7 @@ func (c *client) sendHello() error {
 
 // send sends an RPC out to the wire.
 // Returns the response (for now, as the call is synchronous).
-func (c *client) send(rpc hrpc.Call) (uint32, error) {
+func (c *client) send(rpc hrpc.Call, track bool) (uint32, error) {
 	var err error
 	var request proto.Message
 	var cellblocks net.Buffers
@@ -758,11 +765,17 @@ func (c *client) send(rpc hrpc.Call) (uint32, error) {
 			4+protobufLen, len(b), headerSize, requestSize, header, request))
 	}
 
+	if track {
+		glog.Infof("stage=write")
+	}
 	if cellblocks != nil {
 		bfs := append(net.Buffers{b}, cellblocks...)
 		_, err = bfs.WriteTo(c.conn)
 	} else {
 		err = c.write(b)
+	}
+	if track {
+		glog.Infof("stage=writeDone")
 	}
 	if err != nil {
 		return id, ServerError{err}
